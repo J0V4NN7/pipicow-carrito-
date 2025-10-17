@@ -1,0 +1,219 @@
+// -*- coding: utf-8 -*-
+// Raspberry Pi Pico W — Carrito + HC-SR04 + Sensor IR + HTTP (con parada automática + panel de prueba)
+
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ------- WiFi -------
+const char* WIFI_SSID = "Diseno_de_Interfaces";
+const char* WIFI_PASS = "12345678";
+//const char* WIFI_SSID = "Mega-2.4G-85AD";
+//const char* WIFI_PASS = "bYzJEZvW88";
+//const char* WIFI_SSID = "Isaac";
+//const char* WIFI_PASS = "27.08.10";
+
+WebServer server(80);
+
+// ------- Motores -------
+const int ENA = 7;
+const int IN1 = 6;
+const int IN2 = 5;
+const int ENB = 2;
+const int IN3 = 4;
+const int IN4 = 3;
+
+int VEL_BASE = 200;
+
+// ------- Sensor ultrasónico -------
+const int TRIG_PIN = 17;
+const int ECHO_PIN = 16;
+
+// ------- Sensor infrarrojo -------
+const int IR_PIN = 15;   // GP15 — pin digital del sensor IR
+
+// ------- Variables de seguridad -------
+const float DISTANCIA_MIN_CM = 15.0;  // si algo está más cerca de 15 cm, se detiene
+unsigned long ultimoChequeo = 0;
+bool detenidoPorSensor = false;
+
+// ----------------- Utilidades HTTP -----------------
+inline void sendOK() {
+  server.sendHeader("Connection", "close");
+  server.send(200, "text/plain", "OK");
+}
+
+inline void sendText(const String& s) {
+  server.sendHeader("Connection", "close");
+  server.send(200, "text/plain", s);
+}
+
+// ----------------- Motores -----------------
+void setMotors(int left, int right) {
+  int wl = constrain(abs(left), 0, 255);
+  int wr = constrain(abs(right), 0, 255);
+
+  if (left > 0)      { digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);  }
+  else if (left < 0) { digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); }
+  else               { digitalWrite(IN1, LOW);  digitalWrite(IN2, LOW);  }
+  analogWrite(ENA, wl);
+
+  if (right > 0)      { digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);  }
+  else if (right < 0) { digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); }
+  else                { digitalWrite(IN3, LOW);  digitalWrite(IN4, LOW);  }
+  analogWrite(ENB, wr);
+}
+
+void detener()          { setMotors(0, 0); }
+void adelante()         { setMotors(VEL_BASE, VEL_BASE); }
+void atras()            { setMotors(-VEL_BASE, -VEL_BASE); }
+void girar_izquierda()  { setMotors(-VEL_BASE, VEL_BASE); }
+void girar_derecha()    { setMotors(VEL_BASE, -VEL_BASE); }
+
+// ----------------- Sensor ultrasónico -----------------
+void initUltrasonico() {
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
+}
+
+float leerDistanciaCM() {
+  digitalWrite(TRIG_PIN, LOW);  delayMicroseconds(4);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  unsigned long u = pulseIn(ECHO_PIN, HIGH, 25000UL);
+  if (u == 0) return -1.0;
+  return u / 58.0;
+}
+
+// ----------------- Sensor infrarrojo -----------------
+void initInfrarrojo() {
+  pinMode(IR_PIN, INPUT);
+}
+
+bool leerInfrarrojo() {
+  int val = digitalRead(IR_PIN);
+  return (val == LOW);  // LOW = obstáculo detectado
+}
+
+// ----------------- Handlers HTTP -----------------
+void handleRoot()  { sendText("OK\n"); }
+void handlePing()  { sendText("pong\n"); }
+void handleNotFound() { server.sendHeader("Connection", "close"); server.send(404, "text/plain", "Not found"); }
+
+void handleAdelante()        { detenidoPorSensor = false; adelante();        sendOK(); }
+void handleAtras()           { detenidoPorSensor = false; atras();           sendOK(); }
+void handleGirarIzquierda()  { detenidoPorSensor = false; girar_izquierda(); sendOK(); }
+void handleGirarDerecha()    { detenidoPorSensor = false; girar_derecha();   sendOK(); }
+void handleDetener()         { detenidoPorSensor = true; detener();          sendOK(); }
+
+void handleVelocidad() {
+  if (server.hasArg("v")) {
+    VEL_BASE = constrain(server.arg("v").toInt(), 0, 255);
+  }
+  sendText(String(VEL_BASE));
+}
+
+void handleDistancia() {
+  float d = leerDistanciaCM();
+  if (d < 0) {
+    server.sendHeader("Connection", "close");
+    server.send(503, "application/json", "{\"cm\":null}");
+  } else {
+    char buf[16]; dtostrf(d, 0, 1, buf);
+    String json = String("{\"cm\":") + buf + "}";
+    server.sendHeader("Connection", "close");
+    server.send(200, "application/json", json);
+  }
+}
+
+void handleInfrarrojo() {
+  bool obstaculo = leerInfrarrojo();
+  String json = String("{\"obstaculo\":") + (obstaculo ? "true" : "false") + "}";
+  server.sendHeader("Connection", "close");
+  server.send(200, "application/json", json);
+}
+
+// ----------------- NUEVO: Página de prueba sensores -----------------
+void handleSensores() {
+  float d = leerDistanciaCM();
+  bool ir = leerInfrarrojo();
+
+  String html = "<html><head><meta http-equiv='refresh' content='1'>";
+  html += "<style>body{font-family:sans-serif;text-align:center;background:#fafafa;color:#222;}";
+  html += "h1{margin-top:20px;} h2{color:#0078d7;} p{font-size:20px;}</style></head><body>";
+  html += "<h1>Panel de Sensores</h1>";
+
+  if (d < 0) html += "<h2>Ultrasonico: <span style='color:red;'>Sin lectura</span></h2>";
+  else html += "<h2>Ultrasonico: " + String(d,1) + " cm</h2>";
+
+  html += "<h2>Infrarrojo: " + String(ir ? "⚠️ Obstáculo detectado" : "✔️ Libre") + "</h2>";
+  html += "<p><small>Actualizando cada 1 s</small></p>";
+  html += "</body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+// ----------------- Setup / Loop -----------------
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // Pines motores
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT); pinMode(ENA, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT); pinMode(ENB, OUTPUT);
+  detener();
+
+  // Sensores
+  initUltrasonico();
+  initInfrarrojo();
+
+  // WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname("pico-car");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Conectando a WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("WiFi OK. IP: "); Serial.println(WiFi.localIP());
+
+  // Endpoints
+  server.on("/",               handleRoot);
+  server.on("/ping",           handlePing);
+  server.on("/adelante",       handleAdelante);
+  server.on("/atras",          handleAtras);
+  server.on("/girar_izquierda",handleGirarIzquierda);
+  server.on("/girar_derecha",  handleGirarDerecha);
+  server.on("/detener",        handleDetener);
+  server.on("/velocidad",      handleVelocidad);
+  server.on("/distancia",      handleDistancia);
+  server.on("/infrarrojo",     handleInfrarrojo);
+  server.on("/sensores",       handleSensores);   // <-- NUEVA PÁGINA DE PRUEBA
+  server.onNotFound(handleNotFound);
+  server.begin();
+
+  Serial.println("HTTP server listo.");
+}
+
+void loop() {
+  server.handleClient();
+
+  // --- MONITOREO AUTOMÁTICO DE OBSTÁCULOS ---
+  if (millis() - ultimoChequeo > 200) {  // cada 0.2 segundos
+    ultimoChequeo = millis();
+    float d = leerDistanciaCM();
+    bool ir = leerInfrarrojo();
+
+    if ((d > 0 && d < DISTANCIA_MIN_CM) || ir) {
+      if (!detenidoPorSensor) {
+        Serial.println("⚠️ Obstáculo detectado. Deteniendo motores...");
+        detener();
+        detenidoPorSensor = true;
+      }
+    } else {
+      detenidoPorSensor = false;
+    }
+  }
+}
