@@ -1,0 +1,431 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Nov  5 23:14:30 2025
+
+@author: Jovanny Lezama
+"""
+
+"""
+Spyder-friendly GUI for Raspberry Pi Pico W + Bluetooth module
+Features:
+- Connect via WiFi (IP:port) or Bluetooth (COM port)
+- Read data from two sensors: ultrasonic and infrared
+- Show numeric distance, detection status, live plot, and console log
+- Control the car using direction buttons (Forward, Backward, Left, Right, Stop)
+- Modern green-on-black "Matrix" style
+
+Assumptions / Protocol (make sure your Pico/Arduino code handles these commands):
+  FORWARD\n, BACKWARD\n, LEFT\n, RIGHT\n, STOP\n
+
+Requirements (install via pip):
+  pip install pyqt5 pyqtgraph pyserial
+
+Run this file in Spyder or any Python IDE. Tested with Python 3.8+.
+"""
+
+import sys
+import socket
+import threading
+import time
+from datetime import datetime
+
+from PyQt5 import QtCore, QtGui, QtWidgets
+import pyqtgraph as pg
+import serial
+import serial.tools.list_ports
+
+
+# -------------------------- Helper Classes --------------------------
+class ReaderThread(QtCore.QThread):
+    line_received = QtCore.pyqtSignal(str)
+    disconnected = QtCore.pyqtSignal()
+
+    def __init__(self, sock=None, ser=None, parent=None):
+        super().__init__(parent)
+        self._sock = sock
+        self._ser = ser
+        self._running = True
+
+    def run(self):
+        try:
+            if self._ser:
+                self._read_serial()
+            elif self._sock:
+                self._read_socket()
+        except Exception as e:
+            print('ReaderThread exception:', e)
+        finally:
+            self.disconnected.emit()
+
+    def stop(self):
+        self._running = False
+
+    def _read_serial(self):
+        ser = self._ser
+        ser.timeout = 1.0
+        while self._running:
+            try:
+                line = ser.readline().decode(errors='ignore').strip()
+            except Exception:
+                break
+            if line:
+                self.line_received.emit(line)
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+    def _read_socket(self):
+        sock = self._sock
+        sock.settimeout(1.0)
+        buff = b''
+        while self._running:
+            try:
+                data = sock.recv(1024)
+                if not data:
+                    break
+                buff += data
+                while b"\n" in buff:
+                    line, buff = buff.split(b"\n", 1)
+                    text = line.decode(errors='ignore').strip()
+                    if text:
+                        self.line_received.emit(text)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+# -------------------------- Main Window --------------------------
+class PicoCarUI(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('PicoW Car Control — Matrix Theme')
+        self.setGeometry(200, 100, 1000, 700)
+        self._reader = None
+        self._sock = None
+        self._ser = None
+
+        self._ultra_history = []
+        self._time_history = []
+        self._max_points = 300
+
+        self._build_ui()
+        self._apply_styles()
+        self._connect_signals()
+
+        self._plot_timer = QtCore.QTimer()
+        self._plot_timer.timeout.connect(self._update_plot)
+        self._plot_timer.start(150)
+
+    def _build_ui(self):
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        layout = QtWidgets.QVBoxLayout(central)
+
+        top_row = QtWidgets.QHBoxLayout()
+
+        wifi_group = QtWidgets.QGroupBox('WiFi (TCP)')
+        wifi_layout = QtWidgets.QHBoxLayout()
+        self.ip_input = QtWidgets.QLineEdit('192.168.4.1')
+        self.port_input = QtWidgets.QLineEdit('12345')
+        self.wifi_connect_btn = QtWidgets.QPushButton('Connect WiFi')
+        wifi_layout.addWidget(QtWidgets.QLabel('IP:'))
+        wifi_layout.addWidget(self.ip_input)
+        wifi_layout.addWidget(QtWidgets.QLabel('Port:'))
+        wifi_layout.addWidget(self.port_input)
+        wifi_layout.addWidget(self.wifi_connect_btn)
+        wifi_group.setLayout(wifi_layout)
+
+        bt_group = QtWidgets.QGroupBox('Bluetooth (Serial COM)')
+        bt_layout = QtWidgets.QHBoxLayout()
+        self.com_combo = QtWidgets.QComboBox()
+        self.refresh_com_btn = QtWidgets.QPushButton('Refresh')
+        self.bt_connect_btn = QtWidgets.QPushButton('Connect BT')
+        self.baud_input = QtWidgets.QLineEdit('115200')
+        bt_layout.addWidget(QtWidgets.QLabel('Port:'))
+        bt_layout.addWidget(self.com_combo)
+        bt_layout.addWidget(self.refresh_com_btn)
+        bt_layout.addWidget(QtWidgets.QLabel('Baud:'))
+        bt_layout.addWidget(self.baud_input)
+        bt_layout.addWidget(self.bt_connect_btn)
+        bt_group.setLayout(bt_layout)
+
+        top_row.addWidget(wifi_group)
+        top_row.addWidget(bt_group)
+        layout.addLayout(top_row)
+
+        center_row = QtWidgets.QHBoxLayout()
+
+        left_col = QtWidgets.QVBoxLayout()
+        status_group = QtWidgets.QGroupBox('Status')
+        status_layout = QtWidgets.QFormLayout()
+        self.conn_status = QtWidgets.QLabel('Disconnected')
+        self.conn_status.setAlignment(QtCore.Qt.AlignCenter)
+        status_layout.addRow('Connection:', self.conn_status)
+        self.ultra_label = QtWidgets.QLabel('-- cm')
+        self.ultra_label.setFont(QtGui.QFont('Consolas', 36))
+        self.ultra_label.setAlignment(QtCore.Qt.AlignCenter)
+        status_layout.addRow('Distance:', self.ultra_label)
+        self.ir_label = QtWidgets.QLabel('No')
+        self.ir_label.setFont(QtGui.QFont('Consolas', 20))
+        self.ir_label.setAlignment(QtCore.Qt.AlignCenter)
+        status_layout.addRow('IR Detected:', self.ir_label)
+        status_group.setLayout(status_layout)
+        left_col.addWidget(status_group)
+
+        # Direction controls
+        control_group = QtWidgets.QGroupBox('Car Controls')
+        grid = QtWidgets.QGridLayout()
+        self.btn_forward = QtWidgets.QPushButton('↑ Forward')
+        self.btn_backward = QtWidgets.QPushButton('↓ Backward')
+        self.btn_left = QtWidgets.QPushButton('← Left')
+        self.btn_right = QtWidgets.QPushButton('→ Right')
+        self.btn_stop = QtWidgets.QPushButton('■ Stop')
+
+        grid.addWidget(self.btn_forward, 0, 1)
+        grid.addWidget(self.btn_left, 1, 0)
+        grid.addWidget(self.btn_stop, 1, 1)
+        grid.addWidget(self.btn_right, 1, 2)
+        grid.addWidget(self.btn_backward, 2, 1)
+        control_group.setLayout(grid)
+        left_col.addWidget(control_group)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        self.disconnect_btn = QtWidgets.QPushButton('Disconnect')
+        self.clear_log_btn = QtWidgets.QPushButton('Clear Log')
+        btn_row.addWidget(self.disconnect_btn)
+        btn_row.addWidget(self.clear_log_btn)
+        left_col.addLayout(btn_row)
+
+        center_row.addLayout(left_col, 2)
+
+        plot_col = QtWidgets.QVBoxLayout()
+        plot_group = QtWidgets.QGroupBox('Live Distance Plot')
+        pg.setConfigOptions(antialias=True)
+        self.plot_widget = pg.PlotWidget()
+        self.plot_widget.setYRange(0, 400)
+        self.plot_widget.showGrid(x=True, y=True)
+        self.plot_curve = self.plot_widget.plot(pen=pg.mkPen(width=2))
+        p_layout = QtWidgets.QVBoxLayout()
+        p_layout.addWidget(self.plot_widget)
+        plot_group.setLayout(p_layout)
+        plot_col.addWidget(plot_group)
+        center_row.addLayout(plot_col, 5)
+
+        layout.addLayout(center_row)
+
+        self.log_browser = QtWidgets.QTextEdit()
+        self.log_browser.setReadOnly(True)
+        self.log_browser.setMinimumHeight(140)
+        layout.addWidget(QtWidgets.QLabel('Console'))
+        layout.addWidget(self.log_browser)
+
+        self._refresh_com_ports()
+
+    def _apply_styles(self):
+        style = """
+        QMainWindow { background-color: #050505; }
+        QLabel { color: #00ff66; }
+        QGroupBox { border: 1px solid #003300; color: #00ff66; margin-top: 6px; }
+        QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 3px 0 3px; }
+        QLineEdit, QComboBox, QTextEdit { background: #001100; color: #00ff66; selection-background-color: #003300; }
+        QPushButton { background: #002200; color: #00ff66; border-radius: 6px; padding: 6px; }
+        QPushButton:hover { background: #004400; }
+        QTextEdit { font-family: Consolas, monospace; }
+        """
+        self.setStyleSheet(style)
+
+    def _connect_signals(self):
+        self.refresh_com_btn.clicked.connect(self._refresh_com_ports)
+        self.wifi_connect_btn.clicked.connect(self._connect_wifi)
+        self.bt_connect_btn.clicked.connect(self._connect_bt)
+        self.disconnect_btn.clicked.connect(self._disconnect)
+        self.clear_log_btn.clicked.connect(lambda: self.log_browser.clear())
+
+        # Car controls
+        self.btn_forward.clicked.connect(lambda: self._send_command('FORWARD'))
+        self.btn_backward.clicked.connect(lambda: self._send_command('BACKWARD'))
+        self.btn_left.clicked.connect(lambda: self._send_command('LEFT'))
+        self.btn_right.clicked.connect(lambda: self._send_command('RIGHT'))
+        self.btn_stop.clicked.connect(lambda: self._send_command('STOP'))
+
+    def _refresh_com_ports(self):
+        self.com_combo.clear()
+        ports = serial.tools.list_ports.comports()
+        for p in ports:
+            self.com_combo.addItem(f"{p.device} - {p.description}", p.device)
+        if self.com_combo.count() == 0:
+            self.com_combo.addItem('No COM ports found')
+
+    def _connect_wifi(self):
+        if self._reader:
+            self._log('Already connected. Disconnect first.')
+            return
+        ip = self.ip_input.text().strip()
+        try:
+            port = int(self.port_input.text().strip())
+        except ValueError:
+            self._log('Invalid port number')
+            return
+        self._log(f'Trying WiFi {ip}:{port} ...')
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((ip, port))
+            sock.settimeout(None)
+        except Exception as e:
+            self._log(f'WiFi connect failed: {e}')
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return
+        self._sock = sock
+        self._start_reader(sock=sock)
+        self.conn_status.setText(f'WiFi: {ip}:{port}')
+        self._log('WiFi connected')
+
+    def _connect_bt(self):
+        if self._reader:
+            self._log('Already connected. Disconnect first.')
+            return
+        idx = self.com_combo.currentIndex()
+        if idx < 0:
+            self._log('Select a COM port')
+            return
+        dev = self.com_combo.itemData(idx)
+        if not dev or dev.startswith('No COM'):
+            self._log('No valid COM port selected')
+            return
+        try:
+            baud = int(self.baud_input.text().strip())
+        except ValueError:
+            self._log('Invalid baud rate')
+            return
+        self._log(f'Trying serial {dev} @ {baud} ...')
+        try:
+            ser = serial.Serial(dev, baud, timeout=1)
+        except Exception as e:
+            self._log(f'Serial open failed: {e}')
+            return
+        self._ser = ser
+        self._start_reader(ser=ser)
+        self.conn_status.setText(f'BT: {dev} @{baud}')
+        self._log('Bluetooth connected')
+
+    def _start_reader(self, sock=None, ser=None):
+        self._reader = ReaderThread(sock=sock, ser=ser)
+        self._reader.line_received.connect(self._on_line)
+        self._reader.disconnected.connect(self._on_disconnected)
+        self._reader.start()
+
+    def _disconnect(self):
+        self._log('Disconnecting...')
+        if self._reader:
+            try:
+                self._reader.stop()
+                self._reader.wait(1000)
+            except Exception:
+                pass
+            self._reader = None
+        try:
+            if self._sock:
+                self._sock.close()
+        except Exception:
+            pass
+        self._sock = None
+        try:
+            if self._ser and self._ser.is_open:
+                self._ser.close()
+        except Exception:
+            pass
+        self._ser = None
+        self.conn_status.setText('Disconnected')
+        self._log('Disconnected')
+
+    def _on_disconnected(self):
+        self._log('Remote closed connection')
+        self._disconnect()
+
+    def _send_command(self, cmd):
+        msg = cmd + '\n'
+        try:
+            if self._sock:
+                self._sock.sendall(msg.encode())
+                self._log(f'Sent (WiFi): {cmd}')
+            elif self._ser and self._ser.is_open:
+                self._ser.write(msg.encode())
+                self._log(f'Sent (BT): {cmd}')
+            else:
+                self._log('Not connected')
+        except Exception as e:
+            self._log(f'Send failed: {e}')
+
+    def _on_line(self, line: str):
+        now = datetime.now().strftime('%H:%M:%S')
+        self._log(f'[{now}] {line}')
+        try:
+            if ':' in line:
+                key, val = line.split(':', 1)
+                key = key.strip().upper()
+                val = val.strip()
+                if key.startswith('ULTRA') or key.startswith('ULTRASONIC') or key == 'DIST':
+                    try:
+                        d = float(val)
+                        self._update_distance(d)
+                    except ValueError:
+                        pass
+                elif key == 'IR' or key == 'INFRA' or key == 'IR_SENSOR':
+                    self._update_ir(val)
+            else:
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        d = float(parts[0])
+                        ir = parts[1]
+                        self._update_distance(d)
+                        self._update_ir(ir)
+                    except Exception:
+                        pass
+        except Exception as e:
+            self._log('Parse error: ' + str(e))
+
+    def _update_distance(self, d: float):
+        t = time.time()
+        self._ultra_history.append(d)
+        self._time_history.append(t)
+        if len(self._ultra_history) > self._max_points:
+            self._ultra_history.pop(0)
+            self._time_history.pop(0)
+        self.ultra_label.setText(f'{d:.1f} cm')
+
+    def _update_ir(self, val):
+        v = str(val).strip()
+        detected = v not in ('0', 'False', 'false', 'NO', 'No', 'no', '')
+        self.ir_label.setText('Yes' if detected else 'No')
+
+    def _update_plot(self):
+        if not self._ultra_history:
+            return
+        x = list(range(-len(self._ultra_history)+1, 1))
+        self.plot_curve.setData(x, self._ultra_history)
+
+    def _log(self, text: str):
+        ts = datetime.now().strftime('%H:%M:%S')
+        self.log_browser.append(f'[{ts}] {text}')
+
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    win = PicoCarUI()
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == '__main__':
+    main()
